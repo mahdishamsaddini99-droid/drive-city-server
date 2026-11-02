@@ -12,11 +12,13 @@ const players = {};
 
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
-  players[socket.id] = { x: 0, y: 0, z: 0, rotation: 0, vehicleType: 'walking' };
-
+  
+  socket.emit('currentPlayers', players);
+  
   socket.on('playerMovement', (data) => {
     players[socket.id] = { ...data, id: socket.id };
     socket.broadcast.emit('playerMoved', players[socket.id]);
+    socket.emit('playerMoved', players[socket.id]); 
   });
 
   socket.on('disconnect', () => {
