@@ -5,7 +5,6 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 
@@ -30,7 +29,6 @@ const io = new Server(server, {
 const players = {};
 
 // myPlayerID (شناسه ۸ رقمی) → socket.id
-// برای پیدا کردن گیرنده انتقال سکه
 const playerIdToSocket = {};
 
 // ======================================================
@@ -60,9 +58,7 @@ io.on('connection', (socket) => {
     id: socket.id,
     playerId: null,
     name: 'ناشناس',
-    x: 0,
-    y: 0,
-    z: 0,
+    x: 0, y: 0, z: 0,
     rotation: 0,
     vehicleType: 'walking',
     skin: 'boy',
@@ -70,7 +66,7 @@ io.on('connection', (socket) => {
   };
 
   // ------------------------------------------------------
-  // ۱) ثبت اطلاعات بازیکن (شناسه و اسم)
+  // ۱) ثبت اطلاعات بازیکن
   // ------------------------------------------------------
   socket.on('setPlayerInfo', (data) => {
     if (!players[socket.id]) return;
@@ -78,10 +74,8 @@ io.on('connection', (socket) => {
 
     const playerId = String(data.id || '').slice(0, 16);
     const name = String(data.name || 'ناشناس').slice(0, 15);
-
     if (!playerId) return;
 
-    // اگه این شناسه قبلاً به سوکت دیگه‌ای وصل بود، آزادش کن
     if (playerIdToSocket[playerId] && playerIdToSocket[playerId] !== socket.id) {
       delete playerIdToSocket[playerId];
     }
@@ -92,28 +86,24 @@ io.on('connection', (socket) => {
 
     console.log('[i] ثبت بازیکن:', name, '| شناسه:', playerId);
 
-    // پیام سیستمی ورود
     socket.broadcast.emit('systemMessage', name + ' وارد بازی شد');
   });
 
   // ------------------------------------------------------
-  // ۲) ارسال لیست بازیکن‌های موجود به تازه‌وارد
+  // ۲) ارسال لیست بازیکن‌های موجود
   // ------------------------------------------------------
   const currentPlayers = {};
   for (const id in players) {
     if (id !== socket.id) currentPlayers[id] = players[id];
   }
   socket.emit('currentPlayers', currentPlayers);
-
-  // به بقیه بگو یکی جدید اومد
   socket.broadcast.emit('newPlayer', socket.id);
 
   // ------------------------------------------------------
   // ۳) حرکت بازیکن
   // ------------------------------------------------------
   socket.on('playerMovement', (data) => {
-    if (!players[socket.id]) return;
-    if (!data) return;
+    if (!players[socket.id] || !data) return;
 
     const p = players[socket.id];
     p.x = Number(data.x) || 0;
@@ -145,60 +135,29 @@ io.on('connection', (socket) => {
     const toId = String(data.toId || '');
     const amount = Math.floor(Number(data.amount));
 
-    // اعتبارسنجی پایه
     if (!fromId || !toId || !amount || amount <= 0) {
-      socket.emit('transferResult', {
-        success: false,
-        message: 'اطلاعات انتقال نامعتبر است'
-      });
-      return;
+      return socket.emit('transferResult', { success: false, message: 'اطلاعات انتقال نامعتبر است' });
     }
-
     if (fromId === toId) {
-      socket.emit('transferResult', {
-        success: false,
-        message: 'نمی‌تونی به خودت سکه بدی'
-      });
-      return;
+      return socket.emit('transferResult', { success: false, message: 'نمی‌تونی به خودت سکه بدی' });
     }
-
     if (amount < 100) {
-      socket.emit('transferResult', {
-        success: false,
-        message: 'حداقل انتقال ۱۰۰ سکه است'
-      });
-      return;
+      return socket.emit('transferResult', { success: false, message: 'حداقل انتقال ۱۰۰ سکه است' });
     }
-
     if (amount > 10000000) {
-      socket.emit('transferResult', {
-        success: false,
-        message: 'حداکثر انتقال ۱۰,۰۰۰,۰۰۰ سکه است'
-      });
-      return;
+      return socket.emit('transferResult', { success: false, message: 'حداکثر ۱۰,۰۰۰,۰۰۰ سکه است' });
     }
-
-    // فرستنده باید همون سوکت باشه
     if (players[socket.id]?.playerId !== fromId) {
-      socket.emit('transferResult', {
-        success: false,
-        message: 'شناسه فرستنده با اتصال فعلی هم‌خوانی ندارد'
-      });
-      return;
+      return socket.emit('transferResult', { success: false, message: 'شناسه فرستنده هم‌خوانی ندارد' });
     }
 
     const targetSocketId = playerIdToSocket[toId];
     if (!targetSocketId) {
-      socket.emit('transferResult', {
-        success: false,
-        message: 'گیرنده آنلاین نیست'
-      });
-      return;
+      return socket.emit('transferResult', { success: false, message: 'گیرنده آنلاین نیست' });
     }
 
     const senderName = players[socket.id]?.name || data.fromName || 'بازیکن';
 
-    // به گیرنده خبر بده
     io.to(targetSocketId).emit('receiveCoins', {
       fromId,
       fromName: senderName,
@@ -206,13 +165,7 @@ io.on('connection', (socket) => {
       amount
     });
 
-    // به فرستنده تأیید بده
-    socket.emit('transferResult', {
-      success: true,
-      amount,
-      toId,
-      message: 'انتقال انجام شد'
-    });
+    socket.emit('transferResult', { success: true, amount, toId, message: 'انتقال انجام شد' });
 
     console.log('[💸]', senderName, '→', toId, ':', amount, 'سکه');
   });
@@ -228,13 +181,14 @@ io.on('connection', (socket) => {
     const p = players[socket.id];
     const name = (p?.name || data.name || 'ناشناس').slice(0, 15);
 
-    // برای همه (از جمله خود فرستنده) بفرست
     io.emit('chatMessage', {
       id: p?.playerId || data.id || socket.id,
       name,
       text,
       time: Date.now()
     });
+
+    console.log('[💬]', name, ':', text);
   });
 
   // ------------------------------------------------------
@@ -253,7 +207,7 @@ io.on('connection', (socket) => {
 });
 
 // ======================================================
-// پاکسازی بازیکن‌های راکد (در صورت قطع نشدن)
+// پاکسازی بازیکن‌های راکد
 // ======================================================
 setInterval(() => {
   const now = Date.now();
