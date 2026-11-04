@@ -58,6 +58,7 @@ io.on('connection', (socket) => {
     id: socket.id,
     playerId: null,
     name: 'ناشناس',
+    hasBlueTick: false,
     x: 0, y: 0, z: 0,
     rotation: 0,
     vehicleType: 'walking',
@@ -66,14 +67,14 @@ io.on('connection', (socket) => {
   };
 
   // ------------------------------------------------------
-  // ۱) ثبت اطلاعات بازیکن
+  // ۱) ثبت اطلاعات بازیکن (شناسه، اسم و تیک آبی)
   // ------------------------------------------------------
   socket.on('setPlayerInfo', (data) => {
-    if (!players[socket.id]) return;
-    if (!data) return;
+    if (!players[socket.id] || !data) return;
 
     const playerId = String(data.id || '').slice(0, 16);
     const name = String(data.name || 'ناشناس').slice(0, 15);
+
     if (!playerId) return;
 
     if (playerIdToSocket[playerId] && playerIdToSocket[playerId] !== socket.id) {
@@ -82,6 +83,9 @@ io.on('connection', (socket) => {
 
     players[socket.id].playerId = playerId;
     players[socket.id].name = name;
+    if (typeof data.hasBlueTick === 'boolean') {
+      players[socket.id].hasBlueTick = data.hasBlueTick;
+    }
     playerIdToSocket[playerId] = socket.id;
 
     console.log('[i] ثبت بازیکن:', name, '| شناسه:', playerId);
@@ -90,7 +94,7 @@ io.on('connection', (socket) => {
   });
 
   // ------------------------------------------------------
-  // ۲) ارسال لیست بازیکن‌های موجود
+  // ۲) ارسال لیست بازیکن‌های موجود به تازه‌وارد
   // ------------------------------------------------------
   const currentPlayers = {};
   for (const id in players) {
@@ -112,10 +116,19 @@ io.on('connection', (socket) => {
     p.rotation = Number(data.rotation) || 0;
     p.vehicleType = data.vehicleType || 'walking';
     p.skin = data.skin || 'boy';
+    if (typeof data.name === 'string' && data.name.trim()) {
+      p.name = data.name.slice(0, 15);
+    }
+    if (typeof data.hasBlueTick === 'boolean') {
+      p.hasBlueTick = data.hasBlueTick;
+    }
     p.lastSeen = Date.now();
 
     socket.broadcast.emit('playerMoved', {
       id: socket.id,
+      playerId: p.playerId,
+      name: p.name,
+      hasBlueTick: p.hasBlueTick,
       x: p.x,
       y: p.y,
       z: p.z,
@@ -180,11 +193,13 @@ io.on('connection', (socket) => {
 
     const p = players[socket.id];
     const name = (p?.name || data.name || 'ناشناس').slice(0, 15);
+    const hasBlueTick = !!(p?.hasBlueTick);
 
     io.emit('chatMessage', {
       id: p?.playerId || data.id || socket.id,
       name,
       text,
+      hasBlueTick,
       time: Date.now()
     });
 
