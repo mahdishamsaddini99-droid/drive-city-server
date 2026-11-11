@@ -1,5 +1,5 @@
 // ======================================================
-// DRIVE CITY — سرور آنلاین (Socket.IO + Express)
+// DRIVE CITY — سرور آنلاین (Socket.IO + Express + Jail + Police)
 // ======================================================
 
 const express = require('express');
@@ -20,16 +20,14 @@ const io = new Server(server, {
   pingInterval: 25000
 });
 
-// ======================================================
-// رمز مالک
-// ======================================================
 const OWNER_PASSWORD = '1791';
 
 // ======================================================
 // ذخیره‌سازی در حافظه
 // ======================================================
-const players = {};
-const playerIdToSocket = {};
+const players = {};        // socketId -> playerData
+const playerIdToSocket = {}; // playerId -> socketId
+const jailedPlayers = {};    // playerId -> { until }
 
 // ======================================================
 // مسیر فایل‌ها
@@ -63,9 +61,9 @@ function isBanned(playerId) {
   if (!playerId) return null;
   const rec = bans[playerId];
   if (!rec) return null;
-  if (rec.until === 0) return rec;
-  if (Date.now() < rec.until) return rec;
-  delete bans[playerId]; saveBans();
+  if (rec.until === 0) return rec; // دائمی
+  if (Date.now() < rec.until) return rec; // هنوز بن هست
+  delete bans[playerId]; saveBans(); // منقضی شده
   return null;
 }
 
@@ -87,7 +85,6 @@ function unbanPlayer(playerId) {
   const existed = !!bans[playerId];
   if (existed) { delete bans[playerId]; saveBans(); }
 
-  // اگه بازیکن آنلاین بود، بهش بگو آنبن شد
   const socketId = playerIdToSocket[playerId];
   if (socketId) {
     const sock = io.sockets.sockets.get(socketId);
@@ -96,7 +93,6 @@ function unbanPlayer(playerId) {
       console.log('[✅] آنبن آنلاین:', playerId);
     }
   }
-
   return existed;
 }
 
@@ -153,7 +149,7 @@ setInterval(() => {
 }, 60000);
 
 // ======================================================
-// HTTP
+// HTTP Routes
 // ======================================================
 app.get('/', (req, res) => res.send('Drive City server is running ✅ — ' + new Date().toISOString()));
 
@@ -161,21 +157,17 @@ app.get('/health', (req, res) => res.json({
   ok: true,
   online: Object.keys(players).length,
   banned: Object.keys(bans).length,
+  jailed: Object.keys(jailedPlayers).length,
   totalPlayers: Object.keys(playersDB).length,
   uptime: process.uptime()
 }));
 
-// ===== API چک بن (حتی بدون Socket) =====
 app.get('/checkBan/:playerId', (req, res) => {
   const playerId = String(req.params.playerId || '').trim();
   if (!playerId) return res.json({ banned: false });
   const ban = isBanned(playerId);
   if (ban) {
-    return res.json({
-      banned: true,
-      until: ban.until,
-      reason: ban.reason || ''
-    });
+    return res.json({ banned: true, until: ban.until, reason: ban.reason || '' });
   }
   res.json({ banned: false });
 });
@@ -184,7 +176,9 @@ app.get('/checkBan/:playerId', (req, res) => {
 // Socket.IO
 // ======================================================
 io.on('connection', (socket) => {
-  console.log('[+] اتصال:', socket.id, '| آنلاین:', Object.keys(players).length + 1);
+  console.log('[+] اتصال:', socket.id);
+
+  // ساخت پروفایل اولیه (هنوز ناشناس)
   players[socket.id] = {
     id: socket.id, playerId: null, name: 'ناشناس', hasBlueTick: false,
     x: 0, y: 0, z: 0, rotation: 0,
@@ -210,7 +204,6 @@ io.on('connection', (socket) => {
       delete playerIdToSocket[playerId];
     }
 
-    // ثبت در دیتابیس بازیکن‌ها
     recordPlayer(playerId, name, data.hasBlueTick);
 
     players[socket.id].playerId = playerId;
@@ -218,27 +211,29 @@ io.on('connection', (socket) => {
     if (typeof data.hasBlueTick === 'boolean') players[socket.id].hasBlueTick = data.hasBlueTick;
     playerIdToSocket[playerId] = socket.id;
     console.log('[i] ثبت:', name, '| شناسه:', playerId);
+
+    // حالا که ثبت شد، لیست بازیکن‌ها رو براش بفرست
+    const currentPlayers = {};
+    for (const id in players) {
+      if (id !== socket.id && players[id].playerId) {
+        currentPlayers[id] = players[id];
+      }
+    }
+    socket.emit('currentPlayers', currentPlayers);
+    
+    // به بقیه بگو یه بازیکن جدید اومده
+    socket.broadcast.emit('newPlayer', socket.id);
     socket.broadcast.emit('systemMessage', name + ' وارد بازی شد');
   });
-
-  // لیست بازیکن‌های فعلی
-  const currentPlayers = {};
-  for (const id in players) if (id !== socket.id) currentPlayers[id] = players[id];
-  socket.emit('currentPlayers', currentPlayers);
-  socket.broadcast.emit('newPlayer', socket.id);
 
   // ================ حرکت ================
   socket.on('playerMovement', (data) => {
     if (!players[socket.id] || !data) return;
     const p = players[socket.id];
+    if (!p.playerId) return; // هنوز ثبت نشده
 
-    if (!p.playerId) {
-      socket.emit('needPlayerInfo');
-      return;
-    }
-
-    if (isBanned(p.playerId)) {
-      const ban = isBanned(p.playerId);
+    const ban = isBanned(p.playerId);
+    if (ban) {
       socket.emit('youAreBanned', { until: ban.until, reason: ban.reason });
       setTimeout(() => socket.disconnect(true), 3000);
       return;
@@ -264,35 +259,26 @@ io.on('connection', (socket) => {
   // ================ انتقال سکه ================
   socket.on('transferCoins', (data) => {
     if (!data) return;
-
     const senderP = players[socket.id];
-    if (senderP?.playerId && isBanned(senderP.playerId)) {
-      const ban = isBanned(senderP.playerId);
-      socket.emit('youAreBanned', { until: ban.until, reason: ban.reason });
-      setTimeout(() => socket.disconnect(true), 3000);
-      socket.emit('transferResult', { success: false, message: 'شما بن هستید' });
-      return;
-    }
-
     const fromId = String(data.fromId || '');
     const toId = String(data.toId || '');
     const amount = Math.floor(Number(data.amount));
+
     if (!fromId || !toId || !amount || amount <= 0)
       return socket.emit('transferResult', { success: false, message: 'اطلاعات نامعتبر' });
     if (fromId === toId)
       return socket.emit('transferResult', { success: false, message: 'به خودت؟!' });
     if (amount < 100)
       return socket.emit('transferResult', { success: false, message: 'حداقل ۱۰۰ سکه' });
-    if (amount > 10000000)
-      return socket.emit('transferResult', { success: false, message: 'حداکثر ۱۰ میلیون' });
-    if (players[socket.id]?.playerId !== fromId)
+    
+    if (senderP?.playerId !== fromId)
       return socket.emit('transferResult', { success: false, message: 'شناسه فرستنده ناهمخوان' });
 
     const targetSocketId = playerIdToSocket[toId];
     if (!targetSocketId)
       return socket.emit('transferResult', { success: false, message: 'گیرنده آنلاین نیست' });
 
-    const senderName = players[socket.id]?.name || data.fromName || 'بازیکن';
+    const senderName = senderP?.name || data.fromName || 'بازیکن';
     io.to(targetSocketId).emit('receiveCoins', { fromId, fromName: senderName, toId, amount });
     socket.emit('transferResult', { success: true, amount, toId, message: 'انتقال انجام شد' });
   });
@@ -304,15 +290,8 @@ io.on('connection', (socket) => {
     if (!text) return;
 
     const p = players[socket.id];
-
-    if (p?.playerId && isBanned(p.playerId)) {
-      const ban = isBanned(p.playerId);
-      socket.emit('youAreBanned', { until: ban.until, reason: ban.reason });
-      setTimeout(() => socket.disconnect(true), 3000);
-      return;
-    }
-
     const name = (p?.name || data.name || 'ناشناس').slice(0, 15);
+    
     io.emit('chatMessage', {
       id: p?.playerId || data.id || socket.id,
       name, text,
@@ -321,15 +300,73 @@ io.on('connection', (socket) => {
     });
   });
 
+  // ======================================================
+  // سیستم پلیس و زندان
+  // ======================================================
+  socket.on('policeGetOnlinePlayers', () => {
+    const list = [];
+    const p = players[socket.id];
+    if (!p || !p.playerId) return;
+
+    for (const sid in players) {
+      const target = players[sid];
+      if (!target.playerId) continue;
+      
+      const isMe = (target.playerId === p.playerId);
+      const jail = jailedPlayers[target.playerId];
+      const isJailed = jail && (jail.until === 0 || Date.now() < jail.until);
+
+      list.push({
+        playerId: target.playerId,
+        name: target.name,
+        hasBlueTick: target.hasBlueTick,
+        isMe: isMe,
+        jailed: isJailed
+      });
+    }
+    socket.emit('policeOnlinePlayersList', { list });
+  });
+
+  socket.on('policeJailPlayer', (data) => {
+    const p = players[socket.id];
+    if (!p || p.skin !== 'police') return; // فقط پلیس
+
+    const targetId = String(data.targetId || '');
+    const minutes = Number(data.durationMinutes) || 3;
+    if (!targetId) return;
+
+    const until = Date.now() + minutes * 60 * 1000;
+    jailedPlayers[targetId] = { until };
+
+    const targetSocketId = playerIdToSocket[targetId];
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('youAreJailed', { until, jailPos: { x: -80, z: -20 } });
+      socket.emit('policeJailResult', { success: true, message: '✅ بازیکن زندانی شد' });
+    } else {
+      socket.emit('policeJailResult', { success: false, message: '❌ بازیکن آنلاین نیست' });
+    }
+  });
+
+  socket.on('checkJailStatus', () => {
+    const p = players[socket.id];
+    if (!p || !p.playerId) return;
+    
+    const jail = jailedPlayers[p.playerId];
+    if (jail && (jail.until === 0 || Date.now() < jail.until)) {
+      socket.emit('youAreJailed', { until: jail.until, jailPos: { x: -80, z: -20 } });
+    }
+  });
+
   // ================ ادمین: بن ================
   socket.on('adminBan', (data) => {
     if (!data) return;
     const { password, targetId, durationMinutes, reason } = data;
     if (password !== OWNER_PASSWORD)
       return socket.emit('adminBanResult', { success: false, message: '❌ رمز مالک اشتباه' });
+    
     const pid = String(targetId || '').trim();
-    if (!pid)
-      return socket.emit('adminBanResult', { success: false, message: '❌ شناسه خالی' });
+    if (!pid) return socket.emit('adminBanResult', { success: false, message: '❌ شناسه خالی' });
+    
     const minutes = Number(durationMinutes);
     if (isNaN(minutes) || minutes < 0)
       return socket.emit('adminBanResult', { success: false, message: '❌ مدت نامعتبر' });
@@ -342,7 +379,6 @@ io.on('connection', (socket) => {
       message: minutes === 0 ? `✅ ${pid} برای همیشه بن شد` : `✅ ${pid} برای ${minutes} دقیقه بن شد`,
       targetId: pid, until, wasOnline: targetOnline
     });
-    console.log('[🚫]', pid, '|', minutes === 0 ? 'دائمی' : minutes + ' دقیقه');
   });
 
   // ================ ادمین: آنبن ================
@@ -351,9 +387,9 @@ io.on('connection', (socket) => {
     const { password, targetId } = data;
     if (password !== OWNER_PASSWORD)
       return socket.emit('adminUnbanResult', { success: false, message: '❌ رمز مالک اشتباه' });
+    
     const pid = String(targetId || '').trim();
-    if (!pid)
-      return socket.emit('adminUnbanResult', { success: false, message: '❌ شناسه خالی' });
+    if (!pid) return socket.emit('adminUnbanResult', { success: false, message: '❌ شناسه خالی' });
 
     const existed = unbanPlayer(pid);
     socket.emit('adminUnbanResult', {
@@ -425,6 +461,17 @@ setInterval(() => {
       if (p.playerId && playerIdToSocket[p.playerId] === id) delete playerIdToSocket[p.playerId];
       delete players[id];
       io.emit('playerDisconnected', id);
+    }
+  }
+  
+  // آزادسازی زندانی‌ها
+  for (const pid in jailedPlayers) {
+    if (jailedPlayers[pid].until !== 0 && now >= jailedPlayers[pid].until) {
+      delete jailedPlayers[pid];
+      const sid = playerIdToSocket[pid];
+      if (sid) {
+        io.to(sid).emit('youAreFreed');
+      }
     }
   }
 }, 30000);
