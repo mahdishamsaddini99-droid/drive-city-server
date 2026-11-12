@@ -30,7 +30,7 @@ const OWNER_PASSWORD = '1791';
 // ======================================================
 const players = {};
 const playerIdToSocket = {};
-const jailedPlayers = {}; // ذخیره وضعیت زندانی‌ها
+let jailedPlayers = {}; // playerId -> { until }
 
 // ======================================================
 // مسیر فایل‌ها
@@ -38,6 +38,7 @@ const jailedPlayers = {}; // ذخیره وضعیت زندانی‌ها
 const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
 const BANS_FILE = path.join(DATA_DIR, 'bans.json');
 const PLAYERS_DB_FILE = path.join(DATA_DIR, 'players.json');
+const JAIL_FILE = path.join(DATA_DIR, 'jail.json');
 
 let bans = {};
 let playersDB = {};
@@ -73,11 +74,19 @@ function isBanned(playerId) {
 function banPlayer(playerId, untilMs, reason) {
   bans[playerId] = { until: untilMs, reason: reason || 'نقض قوانین', bannedAt: Date.now() };
   saveBans();
+  
+  // 👇 صفر کردن سکه‌های بازیکن در دیتابیس سرور
+  if (playersDB[playerId]) {
+    playersDB[playerId].coins = 0;
+    savePlayersDB();
+  }
+
   const socketId = playerIdToSocket[playerId];
   if (socketId) {
     const sock = io.sockets.sockets.get(socketId);
     if (sock) {
-      sock.emit('youAreBanned', { until: untilMs, reason: reason || 'نقض قوانین' });
+      // 👇 به بازیکن آنلاین هم می‌گیم که سکه‌هاش صفر شده
+      sock.emit('youAreBanned', { until: untilMs, reason: reason || 'نقض قوانین', resetCoins: true });
       setTimeout(() => sock.disconnect(true), 4000);
       console.log('[🚫] کیک آنلاین:', playerId);
     }
@@ -100,8 +109,23 @@ function unbanPlayer(playerId) {
 }
 
 // ======================================================
-// توابع لیست بازیکن‌ها
+// توابع ذخیره زندانی‌ها و بازیکن‌ها
 // ======================================================
+function loadJails() {
+  try {
+    if (fs.existsSync(JAIL_FILE)) {
+      jailedPlayers = JSON.parse(fs.readFileSync(JAIL_FILE, 'utf8')) || {};
+      console.log('[🔒] زندانی‌ها لود شد:', Object.keys(jailedPlayers).length);
+    } else jailedPlayers = {};
+  } catch (e) { console.error('[!] loadJails:', e.message); jailedPlayers = {}; }
+}
+
+function saveJails() {
+  try {
+    fs.writeFileSync(JAIL_FILE, JSON.stringify(jailedPlayers, null, 2), 'utf8');
+  } catch (e) { console.error('[!] saveJails:', e.message); }
+}
+
 function loadPlayersDB() {
   try {
     if (fs.existsSync(PLAYERS_DB_FILE)) {
@@ -128,6 +152,7 @@ function recordPlayer(playerId, name, hasBlueTick) {
     playersDB[playerId] = {
       playerId, name,
       hasBlueTick: !!hasBlueTick,
+      coins: 0, // 👈 سکه اولیه
       firstSeen: now, lastSeen: now
     };
     console.log('[👤] بازیکن جدید:', name, '(', playerId, ')');
@@ -137,6 +162,7 @@ function recordPlayer(playerId, name, hasBlueTick) {
 
 loadBans();
 loadPlayersDB();
+loadJails();
 
 setInterval(() => {
   const now = Date.now(); let changed = false;
@@ -211,6 +237,10 @@ io.on('connection', (socket) => {
     playerIdToSocket[playerId] = socket.id;
     console.log('[i] ثبت:', name, '| شناسه:', playerId);
 
+    // 👇 فرستادن سکه‌های بازیکن از دیتابیس به بازی
+    const savedCoins = playersDB[playerId]?.coins || 0;
+    socket.emit('updateCoins', { coins: savedCoins });
+
     const currentPlayers = {};
     for (const id in players) {
       if (id !== socket.id && players[id].playerId) {
@@ -221,6 +251,21 @@ io.on('connection', (socket) => {
     
     socket.broadcast.emit('newPlayer', socket.id);
     socket.broadcast.emit('systemMessage', name + ' وارد بازی شد');
+  });
+
+  // 👇 ذخیره سکه‌ها در سرور
+  socket.on('syncCoins', (data) => {
+    const p = players[socket.id];
+    if (!p || !p.playerId) return;
+    
+    const newCoins = parseInt(data.coins);
+    if (isNaN(newCoins) || newCoins < 0) return;
+
+    if (!playersDB[p.playerId]) {
+      playersDB[p.playerId] = { playerId: p.playerId, name: p.name, coins: 0 };
+    }
+    playersDB[p.playerId].coins = newCoins;
+    savePlayersDB();
   });
 
   socket.on('playerMovement', (data) => {
@@ -274,6 +319,12 @@ io.on('connection', (socket) => {
       return socket.emit('transferResult', { success: false, message: 'گیرنده آنلاین نیست' });
 
     const senderName = senderP?.name || data.fromName || 'بازیکن';
+    
+    // 👇 آپدیت دیتابیس برای فرستنده و گیرنده
+    if (playersDB[fromId]) playersDB[fromId].coins = (playersDB[fromId].coins || 0) - amount;
+    if (playersDB[toId]) playersDB[toId].coins = (playersDB[toId].coins || 0) + amount;
+    savePlayersDB();
+
     io.to(targetSocketId).emit('receiveCoins', { fromId, fromName: senderName, toId, amount });
     socket.emit('transferResult', { success: true, amount, toId, message: 'انتقال انجام شد' });
   });
@@ -331,10 +382,10 @@ io.on('connection', (socket) => {
 
     const until = Date.now() + minutes * 60 * 1000;
     jailedPlayers[targetId] = { until };
+    saveJails(); // 👈 ذخیره زندان در فایل
 
     const targetSocketId = playerIdToSocket[targetId];
     if (targetSocketId) {
-      // 👇 مختصات دقیق داخل سلول (z: -38)
       io.to(targetSocketId).emit('youAreJailed', { until, jailPos: { x: -80, z: -38 } });
       socket.emit('policeJailResult', { success: true, message: '✅ بازیکن زندانی شد' });
     } else {
@@ -348,7 +399,6 @@ io.on('connection', (socket) => {
     
     const jail = jailedPlayers[p.playerId];
     if (jail && (jail.until === 0 || Date.now() < jail.until)) {
-      // 👇 مختصات دقیق داخل سلول (z: -38)
       socket.emit('youAreJailed', { until: jail.until, jailPos: { x: -80, z: -38 } });
     }
   });
@@ -422,6 +472,7 @@ io.on('connection', (socket) => {
         playerId: pid,
         name: p.name,
         hasBlueTick: !!p.hasBlueTick,
+        coins: p.coins || 0, // 👈 نمایش سکه در لیست بازیکنان
         firstSeen: p.firstSeen,
         lastSeen: p.lastSeen,
         online: !!playerIdToSocket[pid]
@@ -457,15 +508,18 @@ setInterval(() => {
     }
   }
   
+  let jailChanged = false;
   for (const pid in jailedPlayers) {
     if (jailedPlayers[pid].until !== 0 && now >= jailedPlayers[pid].until) {
       delete jailedPlayers[pid];
+      jailChanged = true;
       const sid = playerIdToSocket[pid];
       if (sid) {
         io.to(sid).emit('youAreFreed');
       }
     }
   }
+  if (jailChanged) saveJails(); // 👈 آپدیت فایل زندان
 }, 30000);
 
 server.listen(PORT, '0.0.0.0', () => console.log('🚀 Drive City on port', PORT));
