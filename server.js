@@ -1,5 +1,5 @@
 // ======================================================
-// DRIVE CITY — سرور آنلاین (نسخه کامل)
+// DRIVE CITY — سرور آنلاین (نسخه کامل + سیستم اکانت)
 // ======================================================
 
 const express = require('express');
@@ -29,6 +29,7 @@ const players = {};
 const playerIdToSocket = {};
 const jailedPlayers = {}; 
 const droppedItems = {}; 
+const usersDatabase = {}; // 👈 دیتابیس اکانت‌ها (نام کاربری و رمز)
 
 // ======================================================
 // مسیر فایل‌ها
@@ -156,8 +157,24 @@ io.on('connection', (socket) => {
   players[socket.id] = {
     id: socket.id, playerId: null, name: 'ناشناس', hasBlueTick: false,
     x: 0, y: 0, z: 0, rotation: 0, vehicleType: 'walking', skin: 'boy', lastSeen: Date.now(),
-    parkedCarType: null, parkedCarX: 0, parkedCarZ: 0, parkedCarRot: 0 // 👈 اضافه شدن اطلاعات ماشین پارک شده
+    parkedCarType: null, parkedCarX: 0, parkedCarZ: 0, parkedCarRot: 0
   };
+
+  // 👇 سیستم لاگین و اکانت
+  socket.on('accountLogin', (data) => {
+    const { username, password } = data;
+    if (usersDatabase[username]) {
+      if (usersDatabase[username].password === password) {
+        socket.emit('accountSuccess', { username, playerId: usersDatabase[username].playerId });
+      } else {
+        socket.emit('accountError', 'رمز عبور اشتباه است!');
+      }
+    } else {
+      const newPlayerId = Math.floor(10000000 + Math.random() * 90000000).toString();
+      usersDatabase[username] = { password, playerId: newPlayerId };
+      socket.emit('accountSuccess', { username, playerId: newPlayerId });
+    }
+  });
 
   socket.on('setPlayerInfo', (data) => {
     if (!players[socket.id] || !data) return;
@@ -221,7 +238,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 👇 رویداد جدید برای ذخیره ماشین پارک شده
   socket.on('parkCar', (data) => {
     const p = players[socket.id];
     if (!p) return;
@@ -257,7 +273,7 @@ io.on('connection', (socket) => {
       id: socket.id, playerId: p.playerId, name: p.name, hasBlueTick: p.hasBlueTick,
       x: p.x, y: p.y, z: p.z, rotation: p.rotation,
       vehicleType: p.vehicleType, skin: p.skin,
-      parkedCarType: p.parkedCarType, // 👈 ارسال ماشین پارک شده
+      parkedCarType: p.parkedCarType,
       parkedCarX: p.parkedCarX,
       parkedCarZ: p.parkedCarZ,
       parkedCarRot: p.parkedCarRot
@@ -330,7 +346,7 @@ io.on('connection', (socket) => {
     const newItem = { id: itemId, type: itemType, x: data.x, z: data.z, dropperId: p.playerId, createdAt: Date.now() };
     droppedItems[itemId] = newItem;
 
-    io.emit('itemDropped', newItem); // 👈 به همه بازیکن‌ها بگو
+    io.emit('itemDropped', newItem);
 
     setTimeout(() => {
       if (droppedItems[itemId]) {
