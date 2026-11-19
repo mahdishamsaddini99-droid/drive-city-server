@@ -27,9 +27,12 @@ const io = new Server(server, {
 });
 
 // ======================================================
-// ذخیره‌سازی روی فایل (با تاخیر کوتاه تا فشار نیاد)
+// ذخیره‌سازی دائمی (MongoDB Atlas) — بدون MONGODB_URI روی فایل (موقت)
 // ======================================================
+const { MongoClient } = require('mongodb');
+const MONGODB_URI = process.env.MONGODB_URI || '';
 const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
+let kvCol = null;
 const savers = [];
 
 function readJson(file, fallback) {
@@ -38,31 +41,51 @@ function readJson(file, fallback) {
   } catch (e) { console.error('خطا در خوندن', file, e.message); }
   return fallback;
 }
-function makeSaver(file, getData) {
-  let timer = null;
+
+async function initStorage() {
+  if (!MONGODB_URI) {
+    console.warn('⚠️ MONGODB_URI تنظیم نشده! داده‌ها روی فایل ذخیره می‌شن و با ری‌استارت رندر پاک می‌شن.');
+    return;
+  }
+  const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 20000 });
+  await client.connect();
+  kvCol = client.db(process.env.MONGODB_DB || 'drivecity').collection('kv');
+  console.log('✅ به MongoDB وصل شد (ذخیره‌سازی دائمی)');
+}
+
+async function loadBlob(name, fallback) {
+  if (kvCol) {
+    const doc = await kvCol.findOne({ _id: name });
+    if (doc && typeof doc.json === 'string') return JSON.parse(doc.json) || fallback;
+  }
+  return readJson(path.join(DATA_DIR, name + '.json'), fallback);
+}
+
+function makeSaver(name, getData) {
+  let timer = null, chain = Promise.resolve();
   const write = () => {
-    try { fs.writeFileSync(file, JSON.stringify(getData(), null, 2), 'utf8'); }
-    catch (e) { console.error('خطا در ذخیره', file, e.message); }
+    chain = chain.then(async () => {
+      try {
+        const json = JSON.stringify(getData());
+        if (kvCol) await kvCol.replaceOne({ _id: name }, { _id: name, json, updatedAt: new Date() }, { upsert: true });
+        else fs.writeFileSync(path.join(DATA_DIR, name + '.json'), json, 'utf8');
+      } catch (e) { console.error('خطا در ذخیره', name, e.message); }
+    });
+    return chain;
   };
-  savers.push(() => { if (timer) { clearTimeout(timer); timer = null; } write(); });
+  savers.push(() => { if (timer) { clearTimeout(timer); timer = null; } return write(); });
   return () => {
     if (timer) return;
     timer = setTimeout(() => { timer = null; write(); }, 1500);
   };
 }
-function flushAll() { savers.forEach(f => f()); }
-process.on('SIGTERM', () => { flushAll(); process.exit(0); });
-process.on('SIGINT', () => { flushAll(); process.exit(0); });
+async function flushAll() { await Promise.all(savers.map(f => f())); }
+process.on('SIGTERM', () => { flushAll().finally(() => process.exit(0)); });
+process.on('SIGINT', () => { flushAll().finally(() => process.exit(0)); });
 
-let bans = readJson(path.join(DATA_DIR, 'bans.json'), {});
-let playersDB = readJson(path.join(DATA_DIR, 'players.json'), {});
-let jailedPlayers = readJson(path.join(DATA_DIR, 'jail.json'), {});
-let usersDB = readJson(path.join(DATA_DIR, 'users.json'), {});
-
-const saveBans = makeSaver(path.join(DATA_DIR, 'bans.json'), () => bans);
-const savePlayersDB = makeSaver(path.join(DATA_DIR, 'players.json'), () => playersDB);
-const saveJails = makeSaver(path.join(DATA_DIR, 'jail.json'), () => jailedPlayers);
-const saveUsers = makeSaver(path.join(DATA_DIR, 'users.json'), () => usersDB);
+let bans = {}, playersDB = {}, jailedPlayers = {}, usersDB = {};
+// تا وقتی دیتا کامل لود نشده، هیچی ذخیره نمی‌شه (جلوگیری از پاک شدن دیتای قبلی)
+let saveBans = () => {}, savePlayersDB = () => {}, saveJails = () => {}, saveUsers = () => {};
 
 // ======================================================
 // حافظه‌ی لحظه‌ای
@@ -130,13 +153,15 @@ function unbanPlayer(playerId) {
 }
 
 function recordPlayer(playerId, name, hasBlueTick) {
-  if (!playerId) return;
+  if (!playerId) return false;
+  let created = false;
   const now = Date.now();
   if (playersDB[playerId]) {
     playersDB[playerId].name = name;
     if (typeof hasBlueTick === 'boolean') playersDB[playerId].hasBlueTick = hasBlueTick;
     playersDB[playerId].lastSeen = now;
   } else {
+    created = true;
     playersDB[playerId] = {
       playerId, name,
       hasBlueTick: !!hasBlueTick,
@@ -146,6 +171,7 @@ function recordPlayer(playerId, name, hasBlueTick) {
     };
   }
   savePlayersDB();
+  return created;
 }
 
 setInterval(() => {
@@ -200,7 +226,7 @@ function registerPlayer(socket, playerId, name, hasBlueTick, sendState) {
     delete playerIdToSocket[playerId];
   }
 
-  recordPlayer(playerId, name, hasBlueTick);
+  const created = recordPlayer(playerId, name, hasBlueTick);
 
   const first = p.playerId !== playerId;
   p.playerId = playerId;
@@ -209,7 +235,7 @@ function registerPlayer(socket, playerId, name, hasBlueTick, sendState) {
   playerIdToSocket[playerId] = socket.id;
 
   const pData = playersDB[playerId];
-  if (sendState) {
+  if (sendState && !created) {   // بازیکن جدید: سکه‌ی خودش توی گوشیه، با صفر جایگزین نمی‌شه
     socket.emit('updateCoins', { coins: pData.coins || 0 });
     socket.emit('updateDiamonds', { diamonds: pData.diamonds || 0 });
     socket.emit('updateInventory', { inventory: pData.inventory });
@@ -582,4 +608,20 @@ setInterval(() => {
   if (jailChanged) saveJails();
 }, 30000);
 
-server.listen(PORT, '0.0.0.0', () => console.log('🚀 Drive City on port', PORT));
+(async () => {
+  await initStorage();
+  bans = await loadBlob('bans', {});
+  playersDB = await loadBlob('players', {});
+  jailedPlayers = await loadBlob('jail', {});
+  usersDB = await loadBlob('users', {});
+  saveBans = makeSaver('bans', () => bans);
+  savePlayersDB = makeSaver('players', () => playersDB);
+  saveJails = makeSaver('jail', () => jailedPlayers);
+  saveUsers = makeSaver('users', () => usersDB);
+  saveBans(); savePlayersDB(); saveJails(); saveUsers();   // اگه دیتای فایل بود، منتقل بشه
+  console.log('📦 بازیکن‌ها:', Object.keys(playersDB).length, '| اکانت‌ها:', Object.keys(usersDB).length);
+  server.listen(PORT, '0.0.0.0', () => console.log('🚀 Drive City on port', PORT));
+})().catch(e => {
+  console.error('❌ راه‌اندازی ناموفق (سرور عمداً بالا نمیاد تا دیتا پاک نشه):', e);
+  process.exit(1);
+});
