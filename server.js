@@ -252,6 +252,7 @@ function registerPlayer(socket, playerId, name, hasBlueTick, sendState) {
     socket.emit('updateCoins', { coins: pData.coins || 0 });
     socket.emit('updateDiamonds', { diamonds: pData.diamonds || 0 });
     socket.emit('updateInventory', { inventory: pData.inventory });
+    p.syncLockUntil = Date.now() + 4000;   // چند ثانیه‌ی اول، سکه‌ی کهنه‌ی گوشی روی سرور نوشته نشه
   }
 
   const currentPlayers = {};
@@ -327,6 +328,7 @@ io.on('connection', (socket) => {
   socket.on('syncCoins', (data) => {
     const p = players[socket.id];
     if (!p || !p.playerId || !data) return;
+    if (Date.now() < (p.syncLockUntil || 0)) return;
     const newCoins = parseInt(data.coins);
     if (isNaN(newCoins) || newCoins < 0) return;
     if (playersDB[p.playerId]) { playersDB[p.playerId].coins = newCoins; savePlayersDB(); }
@@ -335,6 +337,7 @@ io.on('connection', (socket) => {
   socket.on('syncDiamonds', (data) => {
     const p = players[socket.id];
     if (!p || !p.playerId || !data) return;
+    if (Date.now() < (p.syncLockUntil || 0)) return;
     const newDiamonds = parseInt(data.diamonds);
     if (isNaN(newDiamonds) || newDiamonds < 0) return;
     if (playersDB[p.playerId]) { playersDB[p.playerId].diamonds = newDiamonds; savePlayersDB(); }
