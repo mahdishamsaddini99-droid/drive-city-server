@@ -11,6 +11,7 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const OWNER_PASSWORD = process.env.OWNER_PASSWORD || '1791';
+const GOLD_PASSWORD = process.env.GOLD_PASSWORD || '5538';   // رمز پک طلایی
 const ITEM_LIFETIME_MS = 5 * 60 * 1000;   // آیتم روی زمین چند دقیقه بمونه
 const MAX_DROPPED_ITEMS = 300;
 const ITEM_TYPES = ['carrot', 'cabbage', 'onion', 'egg', 'gem', 'shell', 'necklace'];
@@ -192,6 +193,16 @@ function removeItem(id, pickerId, type) {
   return true;
 }
 
+let goldFails = [];
+function goldPwOk(pw) {
+  const now = Date.now();
+  goldFails = goldFails.filter(t => now - t < 60000);
+  if (goldFails.length >= 8) return false;
+  if (pw === GOLD_PASSWORD) return true;
+  goldFails.push(now);
+  return false;
+}
+
 function isDriving(vehicleType) {
   return !!vehicleType && vehicleType !== 'walking' && vehicleType !== 'jetski';
 }
@@ -235,6 +246,8 @@ function registerPlayer(socket, playerId, name, hasBlueTick, sendState) {
   playerIdToSocket[playerId] = socket.id;
 
   const pData = playersDB[playerId];
+  p.goldName = !!pData.goldName;
+  socket.emit('goldStatus', { gold: p.goldName });
   if (sendState && !created) {   // بازیکن جدید: سکه‌ی خودش توی گوشیه، با صفر جایگزین نمی‌شه
     socket.emit('updateCoins', { coins: pData.coins || 0 });
     socket.emit('updateDiamonds', { diamonds: pData.diamonds || 0 });
@@ -371,7 +384,7 @@ io.on('connection', (socket) => {
     socket.broadcast.emit('playerMoved', {
       id: socket.id, playerId: p.playerId, name: p.name, hasBlueTick: p.hasBlueTick,
       x: p.x, y: p.y, z: p.z, rotation: p.rotation,
-      vehicleType: p.vehicleType, skin: p.skin
+      vehicleType: p.vehicleType, skin: p.skin, goldName: !!p.goldName
     });
   });
 
@@ -478,7 +491,7 @@ io.on('connection', (socket) => {
     const name = String((p && p.name) || data.name || 'ناشناس').slice(0, 15);
     io.emit('chatMessage', {
       id: (p && p.playerId) || data.id || socket.id, name, text,
-      hasBlueTick: !!(p && p.hasBlueTick), time: Date.now()
+      hasBlueTick: !!(p && p.hasBlueTick), goldName: !!(p && p.goldName), time: Date.now()
     });
   });
 
@@ -527,6 +540,33 @@ io.on('connection', (socket) => {
     if (jail && (jail.until === 0 || Date.now() < jail.until)) {
       socket.emit('youAreJailed', { until: jail.until, jailPos: { x: -80, z: -38 } });
     }
+  });
+
+  // ---------- پک طلایی (اسم طلایی) ----------
+  socket.on('adminGoldAuth', (data) => {
+    socket.emit('adminGoldAuthResult', { ok: !!data && goldPwOk(data.password) });
+  });
+
+  socket.on('adminSetGold', (data) => {
+    if (!data || !goldPwOk(data.password)) return socket.emit('adminGoldResult', { success: false, message: '❌ رمز اشتباه' });
+    const pid = String(data.targetId || '').trim();
+    if (!pid) return socket.emit('adminGoldResult', { success: false, message: '❌ شناسه خالی' });
+    const rec = playersDB[pid];
+    if (!rec) return socket.emit('adminGoldResult', { success: false, message: '❌ بازیکنی با این شناسه پیدا نشد' });
+
+    const gold = !!data.gold;
+    rec.goldName = gold;
+    savePlayersDB();
+
+    const sid = playerIdToSocket[pid];
+    if (sid && players[sid]) {
+      players[sid].goldName = gold;
+      io.to(sid).emit('goldChanged', { playerId: pid, gold });
+    }
+    socket.emit('adminGoldResult', {
+      success: true, gold,
+      message: gold ? `✅ اسم «${rec.name}» طلایی شد` : `✅ پک طلایی «${rec.name}» برداشته شد`
+    });
   });
 
   // ---------- ادمین ----------
